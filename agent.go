@@ -1,9 +1,10 @@
 package agent
 
 import (
+	"time"
+
 	"github.com/Shopify/Sarama"
 	"github.com/dvsekhvalnov/sync4kafka/utils"
-	"time"
 )
 
 type globals struct {
@@ -25,8 +26,6 @@ func Sync(cfg *Config) <-chan *sarama.ConsumerMessage {
 	ticker := time.NewTicker(time.Millisecond * time.Duration(cfg.MetadataRefreshMs))
 
 	cfg.Version = sarama.V0_10_2_0
-
-	// server :=
 
 	ctx := &globals{
 		server: DiscoverServer(cfg.BrokerUrl, cfg),
@@ -66,7 +65,7 @@ func TrackOffsets(in <-chan *sarama.ConsumerMessage, ctx *globals) <-chan *saram
 
 		for msg := range in {
 			out <- msg
-			//TODO: probably commit in batch async, based on number of uncommited offsets or time ticks
+			//TODO: probably commit in batch async, based on number of uncommited offsets or time ticks, worker POOL here
 			Log.Printf("Commiting offset=%v, topic=%v, partition=%v\n", msg.Offset, msg.Topic, msg.Partition)
 			MarkOffsets(ctx, msg.Offset+1, msg.Topic, msg.Partition)
 		}
@@ -74,6 +73,38 @@ func TrackOffsets(in <-chan *sarama.ConsumerMessage, ctx *globals) <-chan *saram
 
 	return out
 }
+
+// func consumerLoop(partitionConsumer sarama.PartitionConsumer) {
+// 	for {
+// 		select {
+// 		case msg := <-partitionConsumer.Messages():
+//
+// 			if msg != nil {
+// 				out <- msg
+// 			}
+// 		case consumerError := <-partitionConsumer.Errors():
+// 			Log.Printf("[ERROR]: %v", consumerError)
+//
+// 			if consumerError == nil {
+// 				Log.Println("Out of sync, re-init consumer")
+//
+// 				//somehow we run out of sync, re-init consumer
+// 				partitionConsumer, err = consumer.ConsumePartition(partition.Topic, partition.ID, sarama.OffsetOldest)
+// 			}
+// 		case <-quit:
+// 			Log.Printf("Closing partition consumer topic=%v, partition=%v\n", partition.Topic, partition.ID)
+// 			if err := partitionConsumer.Close(); err != nil {
+// 				Log.Println("there were problems ", err)
+// 			} else {
+// 				Log.Print("Partition consumer topic=%v, partition=%v was closed successully.\n")
+// 			}
+//
+// 			quit <- true
+//
+// 			return
+// 		}
+// 	}
+// }
 
 func consumePartition(ctx *globals, consumer sarama.Consumer, partition PartitionInfo, out chan *sarama.ConsumerMessage) chan bool {
 	quit := make(chan bool) //signal channel for cancellation
@@ -84,52 +115,64 @@ func consumePartition(ctx *globals, consumer sarama.Consumer, partition Partitio
 
 		Log.Printf("Starting partition consumer, topic=%v, partition=%v\n", partition.Topic, partition.ID)
 
-		offset := ctx.cfg.FetchOffsets(&partition)
+		var offset int64 = ctx.cfg.FetchOffsets(&partition)
 		Log.Printf("Fetched offset=%v, topic=%v, partition=%v\n", offset, partition.Topic, partition.ID)
 
 		//consume everything if no previous offset found
 		if offset < 0 {
-			offset = sarama.OffsetOldest
+			offset = ctx.cfg.Config.Consumer.Offsets.Initial
 		}
 
-		if partitionConsumer, err := consumer.ConsumePartition(partition.Topic, partition.ID, offset); err == nil {
-			//TODO: check errors?
-			// fmt.Printf("Starting parition consumer, topic=%v, partition=%v\n", partition.Topic, partition.Metadata.ID)
+		var partitionConsumer sarama.PartitionConsumer
+		var err error
 
-			for {
+		for partitionConsumer, err = consumer.ConsumePartition(partition.Topic, partition.ID, offset); err != nil; partitionConsumer, err = consumer.ConsumePartition(partition.Topic, partition.ID, offset) {
 
-				select {
-				case msg := <-partitionConsumer.Messages():
+			switch err {
+			case sarama.ErrOffsetOutOfRange:
+				Log.Println("Requested offset is out of range, reseting to initial position:", ctx.cfg.Config.Consumer.Offsets.Initial)
 
-					if msg != nil {
-						out <- msg
-					}
-				case consumerError := <-partitionConsumer.Errors():
-					Log.Printf("[ERROR]: %v", consumerError)
-
-					if consumerError == nil {
-						Log.Println("Out of sync, re-init consumer")
-
-						//somehow we run out of sync, re-init consumer
-						partitionConsumer, err = consumer.ConsumePartition(partition.Topic, partition.ID, sarama.OffsetOldest)
-					}
-				case <-quit:
-					Log.Printf("Closing partition consumer topic=%v, partition=%v\n", partition.Topic, partition.ID)
-					if err := partitionConsumer.Close(); err != nil {
-						Log.Println("there were problems ", err)
-					} else {
-						Log.Print("Partition consumer topic=%v, partition=%v was closed successully.\n")
-					}
-
-					quit <- true
-
+				//have we tried offset reset before?
+				if offset == ctx.cfg.Config.Consumer.Offsets.Initial {
 					return
 				}
-			}
 
-		} else {
-			//TODO: should we retry or what?
-			Log.Printf("There were errors starting consumer, topic=%v, partition=%v\n", partition.Topic, partition.ID)
+				offset = ctx.cfg.Config.Consumer.Offsets.Initial
+
+			default:
+				Log.Printf("There were errors starting consumer, topic=%v, partition=%v, error=%v\n", partition.Topic, partition.ID, err)
+				return
+			}
+		}
+
+		for {
+			select {
+			case msg := <-partitionConsumer.Messages():
+
+				if msg != nil {
+					out <- msg
+				}
+			case consumerError := <-partitionConsumer.Errors():
+				Log.Printf("[ERROR]: %v", consumerError)
+
+				if consumerError == nil {
+					Log.Println("Out of sync, re-init consumer")
+
+					//somehow we run out of sync, re-init consumer
+					partitionConsumer, err = consumer.ConsumePartition(partition.Topic, partition.ID, sarama.OffsetOldest)
+				}
+			case <-quit:
+				Log.Printf("Closing partition consumer topic=%v, partition=%v\n", partition.Topic, partition.ID)
+				if err := partitionConsumer.Close(); err != nil {
+					Log.Println("there were problems ", err)
+				} else {
+					Log.Printf("Partition consumer topic=%v, partition=%v was closed successully.\n", partition.Topic, partition.ID)
+				}
+
+				quit <- true
+
+				return
+			}
 		}
 	}()
 

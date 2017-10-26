@@ -40,9 +40,13 @@ type Config struct {
 }
 
 func NewConfig() *Config {
-	return &Config{
+	cfg := &Config{
 		Config: sarama.NewConfig(),
 	}
+
+	cfg.Config.Consumer.Offsets.Initial = sarama.OffsetOldest
+
+	return cfg
 }
 
 func (cfg *Config) Include(patterns ...string) *Config {
